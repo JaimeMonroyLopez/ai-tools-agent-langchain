@@ -1,0 +1,99 @@
+<h3>Overview</h3>
+<p>I built a conversational ReAct agent with LangChain's <code>initialize_agent</code> (<code>AgentType.CONVERSATIONAL_REACT_DESCRIPTION</code>). It has two tools, a safe <strong>Calculator</strong> and a mock <strong>Search</strong>, a custom prompt template that tells the model when to use each one, and <code>ConversationBufferMemory</code> so follow-up questions can refer to earlier answers. The LLM is Google Gemini (<code>gemini-3.5-flash</code> through <code>langchain-google-genai</code>) with <code>temperature=0</code>, so tool choices are repeatable. LangChain keeps the agent separate from the model, so switching to another LLM such as OpenAI's <code>ChatOpenAI</code> means changing a single line. LangChain 1.x moved the legacy agent API out of <code>langchain</code>, so the imports come from <code>langchain_classic</code>; the classes are the same ones used in the course.</p>
+
+<h3>1. How I created the tools</h3>
+<p><strong>Calculator (eval() made safe).</strong> Calling <code>eval(input)</code> on raw LLM output would run any Python the model writes, for example <code>__import__('os').system(...)</code>. So the tool first parses the expression into an AST and rejects anything that is not plain arithmetic: numbers, + − × ÷ // % **, and a whitelist of functions such as <code>sqrt</code>, <code>round</code> and <code>abs</code>. Very large exponents are also rejected. Only then does it call <code>eval()</code>, with <code>__builtins__</code> disabled. Before parsing, it cleans up input the LLM often sends: thousands separators (<code>1,428,627,663</code>), <code>^</code> for powers, and <code>23 x 5</code>. Errors come back as text, so the agent sees them as an Observation and can retry.</p>
+<p><strong>Mock search.</strong> A small in-memory index of realistic snippets: capital of France, population of India and France, Eiffel Tower height, and a few more. The query is matched by keyword overlap after removing stop words, so "population of India", "India population" and "how many people live in India" all return the same result. Results are labelled <code>[Mock search]</code> and include a fake source.</p>
+<p><strong>Wrapping as LangChain tools.</strong> Each function becomes a <code>Tool(name, func, description)</code>. The description is what the LLM reads when it chooses a tool, so each one says <em>when</em> to use the tool and <em>what input format</em> it expects:</p>
+<pre>Tool(name="Calculator", func=calculator_tool,
+     description="Use for ANY arithmetic or math ... Input must be a single plain math
+                  expression using numbers only, e.g. '23 * 5' or '1428627663 + 34'.")
+Tool(name="Search", func=mock_search_tool,
+     description="Use to look up facts about the world: capitals, populations, places ...
+                  Input should be a short search query. Do not use it for math.")</pre>
+
+<h3>2. Prompt strategy</h3>
+<p>The conversational agent builds its <code>PromptTemplate</code> as <em>prefix + tool list + format instructions + suffix</em>. I wrote a custom prefix and suffix, built the template with <code>ConversationalAgent.create_prompt(...)</code> so I could print and inspect it, and passed the same prefix and suffix to <code>initialize_agent</code> through <code>agent_kwargs</code>. An assert confirms that the agent uses exactly that template.</p>
+<ul>
+  <li><strong>Role:</strong> "a careful research-and-math assistant that answers by choosing the right tool."</li>
+  <li><strong>Explicit tool-selection rules:</strong> (1) any arithmetic goes to Calculator, never mental math; (2) world facts go to Search, never memory; (3) if a question needs both, search first, then pass the number found to Calculator, one tool per step; (4) if the question refers to something earlier ("my first question"), reuse the value from the conversation history; (5) greetings need no tool; (6) give a short final answer and name the tools used.</li>
+  <li><strong>Suffix:</strong> injects <code>{chat_history}</code> (memory), <code>{input}</code> and <code>{agent_scratchpad}</code> (the model's previous Thought/Action/Observation steps).</li>
+</ul>
+<p>Rule 1 matters most. Without it, the model answers "23 * 5" from its own knowledge and the Calculator is never used.</p>
+
+<h3>3. How the agent reasons and selects tools</h3>
+<p>The agent runs a <strong>ReAct loop</strong> (Reason + Act). On each step the LLM writes:</p>
+<pre>Thought: Do I need to use a tool? Yes
+Action: Search
+Action Input: population of India</pre>
+<p>LangChain stops generation at <code>Observation:</code>, runs the chosen tool, and appends its result as the Observation. Then it calls the LLM again with the updated scratchpad. The loop ends when the model writes <code>Thought: Do I need to use a tool? No</code> followed by <code>AI: &lt;answer&gt;</code>. The model chooses a tool by comparing the question with the tool descriptions and the rules in the prefix:</p>
+<ul>
+  <li>"What is 23 * 5?" is arithmetic, so it goes to <strong>Calculator</strong>.</li>
+  <li>"What is the capital of France?" is a world fact, so it goes to <strong>Search</strong>.</li>
+  <li>"Add 34 and search for population of India." is ambiguous: add 34 to what? The agent read the chat history and treated it as "add 34 to the previous result (115)". It called <strong>Calculator</strong> (<code>115 + 34</code>), then <strong>Search</strong> for the population. That is two different tools in one run, plus memory.</li>
+  <li>"Multiply the result of my first question by 2." finds 115 in <code>{chat_history}</code> (memory), then calls <strong>Calculator</strong> with <code>115 * 2</code>.</li>
+</ul>
+<p><strong>A problem I found and fixed.</strong> In my first run with Gemini, tests 2 and 3 answered "I used Search", but the trace had no <code>Observation:</code> line. The model had written the Action and then kept writing, inventing its own final <code>AI:</code> answer in the same response. LangChain's default <code>ConvoOutputParser</code> checks for <code>AI:</code> first, so it accepted that answer and <em>the tool never ran</em>. I replaced it with a small custom parser (<code>FirstActionParser</code>, passed through <code>agent_kwargs</code>) that always executes the <em>first</em> Action and discards anything the model wrote after it. After that, every answer is grounded in a real tool Observation. Lesson: the claim "(Used Search)" means nothing unless the trace shows the Observation.</p>
+<p>Settings: <code>verbose=True</code> prints every Thought/Action/Observation, <code>handle_parsing_errors=True</code> recovers if the LLM breaks the format, and <code>max_iterations=6</code> stops runaway loops.</p>
+
+<h3>4. Sample outputs</h3>
+<p>Real output from the executed notebook (Gemini <code>gemini-3.5-flash</code>, verbose trace):</p>
+<p><strong>Test 1: calculation (Calculator)</strong></p>
+<pre>USER: What is 23 * 5?
+&gt; Entering new AgentExecutor chain...
+Thought: Do I need to use a tool? Yes
+Action: Calculator
+Action Input: 23 * 5
+Observation: 115
+Thought: Do I need to use a tool? No
+AI: 23 * 5 = 115. I used the Calculator tool to find this result.
+&gt; Finished chain.</pre>
+<p><strong>Test 2: search (Search)</strong></p>
+<pre>USER: What is the capital of France?
+&gt; Entering new AgentExecutor chain...
+Thought: Do I need to use a tool? Yes
+Action: Search
+Action Input: capital of France
+Observation: [Mock search] Paris is the capital and largest city of France, with about
+2.1 million residents (11 million in the metro area). Source: mock-encyclopedia.org
+Do I need to use a tool? No
+AI: The capital of France is Paris. I used the Search tool to find this fact.
+&gt; Finished chain.</pre>
+<p><strong>Test 3: both tools in one question (Calculator + Search, using memory)</strong></p>
+<pre>USER: Add 34 and search for population of India.
+&gt; Entering new AgentExecutor chain...
+Thought: The user wants to add 34 to the previous mathematical result (115) and also
+search for the population of India. I need to break this down into steps, using one
+tool per step. First, I will use Calculator to compute 115 + 34.
+Action: Calculator
+Action Input: 115 + 34
+Observation: 149
+Action: Search
+Action Input: population of India
+Observation: [Mock search] India's population is estimated at 1,428,627,663 (UN World
+Population Prospects, 2023), making it the most populous country in the world.
+Thought: Do I need to use a tool? No
+AI: Adding 34 to the previous result (115) gives 149. The estimated population of India
+is 1,428,627,663. I used the Calculator and Search tools to find these results.
+&gt; Finished chain.</pre>
+<p><strong>Test 4: context-aware follow-up (memory + Calculator)</strong></p>
+<pre>USER: Multiply the result of my first question by 2.
+&gt; Entering new AgentExecutor chain...
+Thought: Do I need to use a tool? Yes
+Action: Calculator
+Action Input: 115 * 2
+Observation: 230
+Do I need to use a tool? No
+AI: Multiplying the result of your first question (115) by 2 gives 230.
+I used the Calculator tool to find this result.
+&gt; Finished chain.</pre>
+<p><strong>Memory buffer after the 4 turns</strong> (what is injected into <code>{chat_history}</code>):</p>
+<pre>Human: What is 23 * 5?
+AI: 23 * 5 = 115. I used the Calculator tool to find this result.
+Human: What is the capital of France?
+AI: The capital of France is Paris. I used the Search tool to find this fact.
+Human: Add 34 and search for population of India.
+AI: Adding 34 to the previous result (115) gives 149. The estimated population of India is 1,428,627,663. ...
+Human: Multiply the result of my first question by 2.
+AI: Multiplying the result of your first question (115) by 2 gives 230. ...</pre>
+<p><strong>Summary:</strong> Test 1 → Calculator (115) · Test 2 → Search (Paris) · Test 3 → Memory → Calculator (149) → Search (1,428,627,663) · Test 4 → Memory → Calculator (230). The agent picked the right tool every time and used the conversation history to resolve "the previous result" and "my first question".</p>
